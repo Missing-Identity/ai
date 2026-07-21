@@ -445,8 +445,12 @@ export class GeminiTextAdapter<
   /** Stream Gemini's native JSON response and emit the parsed object before completion. */
   async *structuredOutputStream(
     options: StructuredOutputOptions<GeminiTextProviderOptions>,
-  ): AsyncIterable<StreamChunk> {
-    const { chatOptions, outputSchema } = options
+  ): AsyncIterable<AdapterYieldChunk> {
+    const { chatOptions: requestedChatOptions, outputSchema } = options
+    const chatOptions = {
+      ...requestedChatOptions,
+      runId: requestedChatOptions.runId ?? generateId(this.name),
+    }
     const mappedOptions = this.mapCommonOptionsToGemini(chatOptions)
 
     try {
@@ -465,7 +469,7 @@ export class GeminiTextAdapter<
 
       let rawText = ''
       let finished:
-        | Extract<StreamChunk, { type: typeof EventType.RUN_FINISHED }>
+        | Extract<AdapterYieldChunk, { type: typeof EventType.RUN_FINISHED }>
         | undefined
       let failed = false
       for await (const chunk of this.processStreamChunks(
@@ -1232,7 +1236,7 @@ function structuredStreamError(
   options: TextOptions<GeminiTextProviderOptions>,
   message: string,
   code: string,
-): Extract<StreamChunk, { type: typeof EventType.RUN_ERROR }> {
+): Extract<AdapterYieldChunk, { type: typeof EventType.RUN_ERROR }> {
   return {
     type: EventType.RUN_ERROR,
     runId: options.runId,
