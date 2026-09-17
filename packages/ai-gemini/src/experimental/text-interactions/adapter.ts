@@ -279,7 +279,7 @@ export class GeminiTextInteractionsAdapter<
       const stream = (await this.client.interactions.create(
         { ...request, stream: true } as GeminiInteractionsRequestBody &
           Parameters<typeof this.client.interactions.create>[0],
-        { signal: options.abortController?.signal },
+        { signal: abortSignalFromOptions(options) },
       )) as AsyncIterable<InteractionSSEEvent>
 
       for await (const chunk of translateInteractionEvents(
@@ -427,7 +427,7 @@ export class GeminiTextInteractionsAdapter<
       )
       const result = (await this.client.interactions.create(
         request as Parameters<typeof this.client.interactions.create>[0],
-        { signal: chatOptions.abortController?.signal },
+        { signal: abortSignalFromOptions(chatOptions) },
       )) as Interaction
 
       const rawText = extractTextFromInteraction(result)
@@ -442,9 +442,7 @@ export class GeminiTextInteractionsAdapter<
       try {
         parsed = JSON.parse(rawText)
       } catch {
-        throw new Error(
-          `Failed to parse structured output as JSON. Content: ${rawText.slice(0, 200)}${rawText.length > 200 ? '...' : ''}`,
-        )
+        throw new Error(jsonContentParseError(rawText, 'structured output'))
       }
 
       return { data: parsed, rawText }
@@ -499,7 +497,7 @@ export class GeminiTextInteractionsAdapter<
       const stream = (await this.client.interactions.create(
         request as GeminiInteractionsRequestBody &
           Parameters<typeof this.client.interactions.create>[0],
-        { signal: chatOptions.abortController?.signal },
+        { signal: abortSignalFromOptions(chatOptions) },
       )) as AsyncIterable<InteractionSSEEvent>
 
       let rawText = ''
@@ -558,7 +556,10 @@ export class GeminiTextInteractionsAdapter<
         yield interactionsStructuredStreamError(
           chatOptions,
           runId,
-          'Failed to parse Gemini Interactions structured-output stream as JSON',
+          jsonContentParseError(
+            rawText,
+            'Gemini Interactions structured-output stream',
+          ),
           'parse-error',
         )
         return
@@ -568,9 +569,9 @@ export class GeminiTextInteractionsAdapter<
         name: 'structured-output.complete',
         value: { object, raw: rawText },
         model: chatOptions.model,
-        timestamp,
+        timestamp: Date.now(),
       }
-      yield finished
+      yield { ...finished, timestamp: Date.now() }
     } catch (error) {
       const message =
         error instanceof Error
@@ -588,6 +589,21 @@ export class GeminiTextInteractionsAdapter<
       )
     }
   }
+}
+
+function abortSignalFromOptions(
+  options: Pick<
+    TextOptions<GeminiTextInteractionsProviderOptions>,
+    'request' | 'abortController'
+  >,
+) {
+  return options.request?.signal ?? options.abortController?.signal
+}
+
+function jsonContentParseError(rawText: string, label: string) {
+  const snippet = rawText.slice(0, 200)
+  const ellipsis = rawText.length > 200 ? '...' : ''
+  return `Failed to parse ${label} as JSON. Content: ${snippet}${ellipsis}`
 }
 
 function interactionsStructuredStreamError(

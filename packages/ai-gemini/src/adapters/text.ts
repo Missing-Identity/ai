@@ -417,9 +417,7 @@ export class GeminiTextAdapter<
       try {
         parsed = JSON.parse(rawText)
       } catch {
-        throw new Error(
-          `Failed to parse structured output as JSON. Content: ${rawText.slice(0, 200)}${rawText.length > 200 ? '...' : ''}`,
-        )
+        throw new Error(jsonContentParseError(rawText, 'structured output'))
       }
 
       return {
@@ -442,7 +440,13 @@ export class GeminiTextAdapter<
     }
   }
 
-  /** Stream Gemini's native JSON response and emit the parsed object before completion. */
+  /**
+   * Stream schema-constrained JSON from Gemini natively.
+   *
+   * `chat({ outputSchema, stream: true })` calls this when the adapter
+   * implements it. Without it, the engine buffers `structuredOutput()` and
+   * emits one synthetic delta.
+   */
   async *structuredOutputStream(
     options: StructuredOutputOptions<GeminiTextProviderOptions>,
   ): AsyncIterable<AdapterYieldChunk> {
@@ -512,7 +516,7 @@ export class GeminiTextAdapter<
       } catch {
         yield structuredStreamError(
           chatOptions,
-          'Failed to parse Gemini structured-output stream as JSON',
+          jsonContentParseError(rawText, 'Gemini structured-output stream'),
           'parse-error',
         )
         return
@@ -525,7 +529,7 @@ export class GeminiTextAdapter<
         model: chatOptions.model,
         timestamp: Date.now(),
       }
-      yield finished
+      yield { ...finished, timestamp: Date.now() }
     } catch (error) {
       const rawEvent = toRunErrorRawEvent(error)
       const message =
@@ -1230,6 +1234,12 @@ export class GeminiTextAdapter<
   supportsCombinedToolsAndSchema(): boolean {
     return GEMINI_COMBINED_TOOLS_AND_SCHEMA_MODELS.has(this.model)
   }
+}
+
+function jsonContentParseError(rawText: string, label: string) {
+  const snippet = rawText.slice(0, 200)
+  const ellipsis = rawText.length > 200 ? '...' : ''
+  return `Failed to parse ${label} as JSON. Content: ${snippet}${ellipsis}`
 }
 
 function structuredStreamError(

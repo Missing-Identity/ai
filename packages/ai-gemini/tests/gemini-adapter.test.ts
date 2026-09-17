@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { z } from 'zod'
 import { EventType, chat, summarize } from '@tanstack/ai'
+import { resolveDebugOption } from '@tanstack/ai/adapter-internals'
 import type { AdapterYieldChunk, Tool } from '@tanstack/ai'
 import {
   Type,
@@ -68,6 +69,46 @@ const createStream = (chunks: Array<Record<string, unknown>>) => {
     }
   })()
 }
+
+const testLogger = resolveDebugOption(false)
+
+const cityJsonSchema = {
+  type: 'object',
+  properties: { city: { type: 'string' } },
+}
+
+const cityStreamChunks = [
+  {
+    candidates: [{ content: { parts: [{ text: '{"city":' }] } }],
+  },
+  {
+    candidates: [
+      {
+        content: { parts: [{ text: '"Madrid"}' }] },
+        finishReason: 'STOP',
+      },
+    ],
+    usageMetadata: { totalTokenCount: 4 },
+  },
+]
+
+const collectChunks = async (stream: AsyncIterable<AdapterYieldChunk>) => {
+  const chunks: Array<AdapterYieldChunk> = []
+  for await (const chunk of stream) {
+    chunks.push(chunk)
+  }
+  return chunks
+}
+
+const structuredCompleteEvent = (events: Array<AdapterYieldChunk>) =>
+  events.find(
+    (event) =>
+      event.type === EventType.CUSTOM &&
+      event.name === 'structured-output.complete',
+  )
+
+const runErrorEvent = (events: Array<AdapterYieldChunk>) =>
+  events.find((event) => event.type === EventType.RUN_ERROR)
 
 describe('GeminiAdapter through AI', () => {
   beforeEach(() => {
@@ -1084,40 +1125,19 @@ describe('GeminiAdapter through AI', () => {
 
   it('streams structured output natively and completes before RUN_FINISHED', async () => {
     mocks.generateContentStreamSpy.mockResolvedValue(
-      createStream([
-        {
-          candidates: [{ content: { parts: [{ text: '{"city":' }] } }],
-        },
-        {
-          candidates: [
-            {
-              content: { parts: [{ text: '"Madrid"}' }] },
-              finishReason: 'STOP',
-            },
-          ],
-          usageMetadata: { totalTokenCount: 4 },
-        },
-      ]),
+      createStream(cityStreamChunks),
     )
 
-    const events: Array<AdapterYieldChunk> = []
-    for await (const event of createTextAdapter().structuredOutputStream({
-      chatOptions: {
-        model: 'gemini-2.5-pro',
-        messages: [{ role: 'user', content: 'Return a city' }],
-        logger: {
-          request: vi.fn(),
-          provider: vi.fn(),
-          errors: vi.fn(),
-        } as any,
-      },
-      outputSchema: {
-        type: 'object',
-        properties: { city: { type: 'string' } },
-      },
-    })) {
-      events.push(event)
-    }
+    const events = await collectChunks(
+      createTextAdapter().structuredOutputStream({
+        chatOptions: {
+          model: 'gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'Return a city' }],
+          logger: testLogger,
+        },
+        outputSchema: cityJsonSchema,
+      }),
+    )
 
     const payload = mocks.generateContentStreamSpy.mock.calls[0]![0]
     expect(payload.config).toMatchObject({
@@ -1137,10 +1157,157 @@ describe('GeminiAdapter through AI', () => {
     )
     expect(completeIndex).toBeGreaterThan(-1)
     expect(completeIndex).toBeLessThan(finishedIndex)
-    expect((events[completeIndex] as any).value).toEqual({
-      object: { city: 'Madrid' },
-      raw: '{"city":"Madrid"}',
-    })
+    const complete = structuredCompleteEvent(events)
+    expect(complete?.type).toBe(EventType.CUSTOM)
+    if (complete?.type === EventType.CUSTOM) {
+      expect(complete.value).toEqual({
+        object: { city: 'Madrid' },
+        raw: '{"city":"Madrid"}',
+      })
+    }
+  })
+
+  it('chat({ outputSchema, stream: true }) streams native JSON deltas', async () => {
+    mocks.generateContentStreamSpy.mockResolvedValue(
+      createStream(cityStreamChunks),
+    )
+
+    const events = await collectChunks(
+      chat({
+        adapter: createTextAdapter(),
+        messages: [{ role: 'user', content: 'Return a city' }],
+        outputSchema: z.object({ city: z.string() }),
+        stream: true,
+      }),
+    )
+
+    expect(
+      events.filter((event) => event.type === 'TEXT_MESSAGE_CONTENT').length,
+    ).toBeGreaterThanOrEqual(2)
+    expect(structuredCompleteEvent(events)).toBeDefined()
+  })
+
+  it('emits empty-response when the structured stream has no text', async () => {
+    mocks.generateContentStreamSpy.mockResolvedValue(
+      createStream([
+        {
+          candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+        },
+      ]),
+    )
+
+    const events = await collectChunks(
+      createTextAdapter().structuredOutputStream({
+        chatOptions: {
+          model: 'gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'Return a city' }],
+          logger: testLogger,
+        },
+        outputSchema: cityJsonSchema,
+      }),
+    )
+
+    const runError = runErrorEvent(events)
+    expect(runError?.type).toBe(EventType.RUN_ERROR)
+    if (runError?.type === EventType.RUN_ERROR) {
+      expect(runError.code).toBe('empty-response')
+    }
+    expect(structuredCompleteEvent(events)).toBeUndefined()
+  })
+
+  it('emits parse-error with a JSON snippet when the stream is not JSON', async () => {
+    mocks.generateContentStreamSpy.mockResolvedValue(
+      createStream([
+        {
+          candidates: [
+            {
+              content: { parts: [{ text: '{not valid json' }] },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+      ]),
+    )
+
+    const events = await collectChunks(
+      createTextAdapter().structuredOutputStream({
+        chatOptions: {
+          model: 'gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'Return a city' }],
+          logger: testLogger,
+        },
+        outputSchema: cityJsonSchema,
+      }),
+    )
+
+    const runError = runErrorEvent(events)
+    expect(runError?.type).toBe(EventType.RUN_ERROR)
+    if (runError?.type === EventType.RUN_ERROR) {
+      expect(runError.code).toBe('parse-error')
+      expect(runError.message).toContain('{not valid json')
+    }
+    expect(structuredCompleteEvent(events)).toBeUndefined()
+  })
+
+  it('emits truncated-stream when Gemini never sends a terminal event', async () => {
+    mocks.generateContentStreamSpy.mockResolvedValue(
+      createStream([
+        {
+          candidates: [{ content: { parts: [{ text: '{"city":' }] } }],
+        },
+      ]),
+    )
+
+    const events = await collectChunks(
+      createTextAdapter().structuredOutputStream({
+        chatOptions: {
+          model: 'gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'Return a city' }],
+          logger: testLogger,
+        },
+        outputSchema: cityJsonSchema,
+      }),
+    )
+
+    const runError = runErrorEvent(events)
+    expect(runError?.type).toBe(EventType.RUN_ERROR)
+    if (runError?.type === EventType.RUN_ERROR) {
+      expect(runError.code).toBe('truncated-stream')
+    }
+    expect(structuredCompleteEvent(events)).toBeUndefined()
+  })
+
+  it('stamps RUN_FINISHED at emit time after structured-output.complete', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(1_000)
+      mocks.generateContentStreamSpy.mockResolvedValue(
+        createStream(cityStreamChunks),
+      )
+
+      const events: Array<AdapterYieldChunk> = []
+      for await (const event of createTextAdapter().structuredOutputStream({
+        chatOptions: {
+          model: 'gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'Return a city' }],
+          logger: testLogger,
+        },
+        outputSchema: cityJsonSchema,
+      })) {
+        events.push(event)
+        vi.advanceTimersByTime(1)
+      }
+
+      const complete = structuredCompleteEvent(events)
+      const finished = events.find(
+        (event) => event.type === EventType.RUN_FINISHED,
+      )
+      expect(complete?.timestamp).toBeDefined()
+      expect(finished?.timestamp).toBeDefined()
+      expect(complete!.timestamp).toBeLessThanOrEqual(finished!.timestamp)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('routes summarize() through the gemini chat-stream path', async () => {
