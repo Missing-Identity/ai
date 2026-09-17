@@ -1298,13 +1298,14 @@ describe('GeminiAdapter through AI', () => {
         vi.advanceTimersByTime(1)
       }
 
-      const complete = structuredCompleteEvent(events)
-      const finished = events.find(
+      const completeTs = structuredCompleteEvent(events)?.timestamp
+      const finishedTs = events.find(
         (event) => event.type === EventType.RUN_FINISHED,
-      )
-      expect(complete?.timestamp).toBeDefined()
-      expect(finished?.timestamp).toBeDefined()
-      expect(complete!.timestamp).toBeLessThanOrEqual(finished!.timestamp)
+      )?.timestamp
+      if (typeof completeTs !== 'number' || typeof finishedTs !== 'number') {
+        throw new Error('complete and finished events must carry timestamps')
+      }
+      expect(completeTs).toBeLessThanOrEqual(finishedTs)
     } finally {
       vi.useRealTimers()
     }
